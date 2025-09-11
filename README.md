@@ -60,7 +60,7 @@
 
 1.  **获取工具链**:
     - 克隆或下载集成了 `SmallVMP` 的 LLVM/Hikari 源码。
-    - `[在此处添加您的 LLVM/Hikari 仓库链接]`
+    - `[(https://github.com/NiTianErXing666/SmallVmp)]`
 2.  **编译 LLVM/Clang**:
     - 根据该仓库的说明文档编译工具链。
 3.  **配置环境变量**:
