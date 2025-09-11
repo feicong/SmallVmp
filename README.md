@@ -89,7 +89,7 @@
         int *p = &gArr[4];
         *p = a + b;
         printf("gArr[4]=%d, gMsg=%s
-", gArr[4], gMsg);
+    ", gArr[4], gMsg);
         return a + b;
     }
     ```
