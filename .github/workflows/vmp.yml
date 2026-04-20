@@ -1,0 +1,406 @@
+# Copyright (c) 2025-2026 SmallVMP Project
+# GitHub Actions workflow for building SmallVMP toolchains across multiple platforms
+
+name: vmp
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags-ignore:
+      - '**'
+    paths-ignore:
+      - LICENSE
+      - '**.md'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Target release tag
+        required: false
+        default: latest
+        type: string
+      upload:
+        description: Upload artifacts to release
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.vars.outputs.release_tag }}
+      release_name: ${{ steps.vars.outputs.release_name }}
+      upload: ${{ steps.vars.outputs.upload }}
+    steps:
+      - name: Compute variables
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          release_tag='latest'
+          upload='true'
+          
+          if [ '${{ github.event_name }}' = 'workflow_dispatch' ]; then
+            if [ -n '${{ inputs.release_tag }}' ]; then
+              release_tag='${{ inputs.release_tag }}'
+            fi
+            upload='${{ inputs.upload }}'
+          fi
+          
+          release_name="SmallVMP Toolchains (${release_tag})"
+          
+          {
+            echo "release_tag=$release_tag"
+            echo "release_name=$release_name"
+            echo "upload=$upload"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.label }} toolchain
+    needs: prepare
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux
+            runs_on: ubuntu-24.04
+            archive_ext: tar.xz
+          - label: macos
+            runs_on: macos-15
+            archive_ext: tar.xz
+          - label: windows
+            runs_on: windows-2025
+            archive_ext: zip
+    
+    env:
+      LLVM_TARGETS_TO_BUILD: AArch64;X86
+    
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      
+      - name: Setup MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      
+      - name: Prioritize MSVC linker
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $msvcBin = Join-Path $env:VCINSTALLDIR "Tools\MSVC\$env:VCToolsVersion\bin\Hostx64\x64"
+          $linkExe = Join-Path $msvcBin "link.exe"
+          if (-not (Test-Path $linkExe)) {
+            throw "MSVC linker not found: $linkExe"
+          }
+          $msvcBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & where.exe link
+      
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            curl \
+            git \
+            ninja-build \
+            pkg-config \
+            xz-utils
+      
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install ninja
+      
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          choco install ninja --yes --no-progress
+          echo "/c/ProgramData/chocolatey/bin" >> "$GITHUB_PATH"
+      
+      - name: Detect host triple
+        id: host
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          release_tag_safe="$(printf '%s' '${{ needs.prepare.outputs.release_tag }}' | sed 's/[^A-Za-z0-9._-]/-/g')"
+          
+          case "${RUNNER_OS}" in
+            Linux)
+              case "$(uname -m)" in
+                x86_64) host_triple="x86_64-unknown-linux-gnu" ;;
+                aarch64|arm64) host_triple="aarch64-unknown-linux-gnu" ;;
+                *) echo "Unsupported Linux architecture: $(uname -m)" >&2; exit 1 ;;
+              esac
+              ;;
+            macOS)
+              case "$(uname -m)" in
+                x86_64) host_triple="x86_64-apple-darwin" ;;
+                arm64) host_triple="aarch64-apple-darwin" ;;
+                *) echo "Unsupported macOS architecture: $(uname -m)" >&2; exit 1 ;;
+              esac
+              ;;
+            Windows)
+              case "${PROCESSOR_ARCHITECTURE}" in
+                AMD64) host_triple="x86_64-pc-windows-msvc" ;;
+                ARM64) host_triple="aarch64-pc-windows-msvc" ;;
+                *) echo "Unsupported Windows architecture: ${PROCESSOR_ARCHITECTURE}" >&2; exit 1 ;;
+              esac
+              ;;
+            *)
+              echo "Unsupported operating system: ${RUNNER_OS}" >&2
+              exit 1
+              ;;
+          esac
+          
+          archive_name="smallvmp-toolchain-${release_tag_safe}-${host_triple}.${{ matrix.archive_ext }}"
+          
+          {
+            echo "host_triple=$host_triple"
+            echo "archive_name=$archive_name"
+          } >> "$GITHUB_OUTPUT"
+      
+      - name: Build LLVM with SmallVMP
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          cmake_args=(
+            -S llvm
+            -B build
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install"
+            -DLLVM_TARGETS_TO_BUILD="${LLVM_TARGETS_TO_BUILD}"
+            -DLLVM_ENABLE_PROJECTS="clang"
+            -DLLVM_INSTALL_UTILS=ON
+            -DLLVM_ENABLE_ASSERTIONS=OFF
+            -DLLVM_INCLUDE_TESTS=OFF
+            -DLLVM_BUILD_TESTS=OFF
+            -DLLVM_INCLUDE_EXAMPLES=OFF
+            -DLLVM_INCLUDE_BENCHMARKS=OFF
+            -DLLVM_BUILD_BENCHMARKS=OFF
+            -DLLVM_BUILD_DOCS=OFF
+            -DLLVM_ENABLE_BACKTRACES=OFF
+            -DLLVM_ENABLE_ZLIB=OFF
+            -DLLVM_ENABLE_ZSTD=OFF
+            -DLLVM_ENABLE_LIBXML2=OFF
+            -DLLVM_ENABLE_TERMINFO=OFF
+            -DLLVM_ENABLE_LIBEDIT=OFF
+            -DBUILD_SHARED_LIBS=OFF
+            -DCMAKE_CXX_STANDARD=17
+          )
+          
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            cmake_args+=(-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded)
+          fi
+          
+          cmake "${cmake_args[@]}"
+          cmake --build build --parallel
+          cmake --install build
+          
+      - name: Replace symlinks with file copies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installDir = "$env:GITHUB_WORKSPACE/install"
+          Get-ChildItem -Path $installDir -Recurse -Force | Where-Object {
+            $_.LinkType -eq 'SymbolicLink'
+          } | ForEach-Object {
+            $targetPath = $_.Target
+            if (-not [System.IO.Path]::IsPathRooted($targetPath)) {
+              $targetPath = Join-Path $_.DirectoryName $targetPath
+            }
+            if (-not (Test-Path -LiteralPath $targetPath)) {
+              throw "Symlink target not found: $($_.FullName) -> $targetPath"
+            }
+
+            $resolvedTarget = (Resolve-Path -LiteralPath $targetPath).ProviderPath
+            Remove-Item -LiteralPath $_.FullName -Force
+
+            if (Test-Path -LiteralPath $resolvedTarget -PathType Container) {
+              Copy-Item -LiteralPath $resolvedTarget -Destination $_.FullName -Recurse -Force
+            } else {
+              Copy-Item -LiteralPath $resolvedTarget -Destination $_.FullName -Force
+            }
+          }
+      
+      - name: Package toolchain
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          archive_path="$GITHUB_WORKSPACE/${{ steps.host.outputs.archive_name }}"
+          install_dir="$GITHUB_WORKSPACE/install"
+          package_root="$RUNNER_TEMP/vmp-package"
+          toolchain_dir="$package_root/smallvmp-toolchain"
+          archive_path_output="$archive_path"
+          
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            archive_path_output="${archive_path//\//\\}"
+            package_root="$(cygpath -u "$package_root")"
+            toolchain_dir="$(cygpath -u "$toolchain_dir")"
+          fi
+          
+          rm -rf "$package_root"
+          mkdir -p "$toolchain_dir"
+          
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            cp -LR "$install_dir"/. "$toolchain_dir"/
+          else
+            tar -C "$install_dir" -cf - . | tar -C "$toolchain_dir" -xf -
+          fi
+          
+          # Clean up unnecessary files
+          rm -rf \
+            "$toolchain_dir/share/man" \
+            "$toolchain_dir/share/doc" \
+            "$toolchain_dir/lib/cmake"
+          
+          # Remove PDB files on Windows
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            pdb_count="$(find "$toolchain_dir" -type f -name '*.pdb' 2>/dev/null | wc -l | tr -d '[:space:]')"
+            if [ "$pdb_count" != "0" ]; then
+              find "$toolchain_dir" -type f -name '*.pdb' -delete
+            fi
+            toolchain_dir_native="$(cygpath -w "$toolchain_dir")"
+            powershell -NoProfile -Command "Compress-Archive -Path '$toolchain_dir_native' -DestinationPath '$archive_path_output' -Force"
+          else
+            tar -C "$package_root" -cJf "$archive_path" smallvmp-toolchain
+          fi
+          
+          echo "archive_path=$archive_path_output" >> "$GITHUB_OUTPUT"
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.label }}-toolchain
+          path: ${{ steps.package.outputs.archive_path }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish release assets
+    if: ${{ needs.prepare.outputs.upload == 'true' }}
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          merge-multiple: true
+      
+      - name: Update release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "${{ needs.prepare.outputs.release_tag }}" "${{ github.sha }}"
+          git push origin "refs/tags/${{ needs.prepare.outputs.release_tag }}" --force
+      
+      - name: Generate release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          {
+            printf '%s\n' \
+              "Branch: \`${{ github.ref_name }}\`" \
+              "Release tag: \`${{ needs.prepare.outputs.release_tag }}\`" \
+              "LLVM commit: \`${{ github.sha }}\`" \
+              '' \
+              '## SmallVMP Toolchains' \
+              '' \
+              'These archives contain pre-built LLVM/Clang toolchains with SmallVMP and Hikari obfuscation support.' \
+              '' \
+              '### Installation' \
+              '' \
+              '1. Download the appropriate archive for your platform' \
+              '2. Extract the archive:' \
+              '   ```bash' \
+              '   # Linux/macOS' \
+              '   tar -xJf smallvmp-toolchain-*.tar.xz' \
+              '   ' \
+              '   # Windows' \
+              '   # Use 7-Zip or built-in extraction' \
+              '   ```' \
+              '3. Add the `bin` directory to your PATH' \
+              '' \
+              '### Usage' \
+              '' \
+              '```c' \
+              '#include "VMP.h"' \
+              '' \
+              'IRVM_SECTION' \
+              'int protected_function(int a, int b) {' \
+              '    return a + b;' \
+              '}' \
+              '```' \
+              '' \
+              'Compile with:' \
+              '```bash' \
+              'clang test.c -o app' \
+              '' \
+              '# With Hikari obfuscation' \
+              'clang test.c -o app -mllvm -enable-bcfobf' \
+              'clang test.c -o app -mllvm -enable-cffobf' \
+              'clang test.c -o app -mllvm -enable-allobf' \
+              '```' \
+              '' \
+              '### Features' \
+              '' \
+              '- **VMP Protection**: Automatic virtualization of marked functions' \
+              '- **Hikari Obfuscation**: BCF, CFF, SPL, SUB and more' \
+              '- **Cross-platform**: Linux, macOS, Windows support' \
+              '- **LLVM-based**: Full LLVM/Clang toolchain integration' \
+              '' \
+              'For more information, visit: https://github.com/${{ github.repository }}'
+          } > release-notes.md
+      
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.prepare.outputs.release_name }}
+          body_path: release-notes.md
+          files: release-assets/*
+          overwrite_files: true
+          make_latest: true
